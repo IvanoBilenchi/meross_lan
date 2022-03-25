@@ -120,7 +120,7 @@ class MLLightBase(me.MerossToggle, light.LightEntity):
 
             if mc.KEY_LUMINANCE in payload:
                 self._attr_color_mode = ColorMode.BRIGHTNESS
-                self._attr_brightness = payload[mc.KEY_LUMINANCE] * 255 // 100
+                self._attr_brightness = int(payload[mc.KEY_LUMINANCE] * 255 / 100 + 0.5)
             else:
                 self._attr_brightness = None
 
@@ -249,7 +249,7 @@ class MLLight(MLLightBase):
 
         # Brightness must always be set in payload
         if ATTR_BRIGHTNESS in kwargs:
-            light[mc.KEY_LUMINANCE] = _sat_1_100(kwargs[ATTR_BRIGHTNESS] * 100 // 255)
+            light[mc.KEY_LUMINANCE] = _sat_1_100(kwargs[ATTR_BRIGHTNESS] * 100 / 255 + 0.5)
         else:
             if mc.KEY_LUMINANCE not in light:
                 light[mc.KEY_LUMINANCE] = 100
