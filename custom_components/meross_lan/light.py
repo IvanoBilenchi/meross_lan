@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import typing
+from typing import List, Tuple
 
 from homeassistant.components import light
 from homeassistant.components.light import (
@@ -36,6 +38,14 @@ if typing.TYPE_CHECKING:
 MSLANY_MIRED_MIN = 153  # math.floor(1/(6500/1000000))
 MSLANY_MIRED_MAX = 371  # math.ceil(1/(2700/1000000))
 
+# Device-specific HS calibration
+DEFAULT_HUE = (0.0, 60.0, 120.0, 180.0, 240.0, 300.0, 360.0)
+HS_CALIBRATION = {
+    'msl120d': ((0.0, 20.0, 120.0, 130.0, 240.0, 355.0, 360.0), 8.0),
+    'msl320m': ((0.0, 25.0, 120.0, 140.0, 240.0, 350.0, 360.0), 8.0),
+    'msl430': ((0.0, 60.0, 120.0, 170.0, 240.0, 320.0, 360.0), None)
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant, config_entry: ConfigEntry, async_add_devices
@@ -68,6 +78,53 @@ def _sat_1_100(value):
         return 1
     else:
         return int(value)
+
+
+def _linear(x: float, p1: (float, float), p2: (float, float)) -> float:
+    m = (p2[1] - p1[1]) / (p2[0] - p1[0])
+    return (x - p1[0]) * m + p1[1]
+
+
+def _piecewise(x: float, points: List[Tuple[float, float]]) -> float:
+    if len(points) > 2:
+        for i, p in enumerate(points[1:-1]):
+            if x < p[0]:
+                return _linear(x, points[i], p)
+    return _linear(x, points[-2], points[-1])
+
+
+def _piecewise_inv(x: float, points: List[Tuple[float, float]]) -> float:
+    return _piecewise(x, [(p[1], p[0]) for p in points])
+
+
+def _bound_exp(x: float, coeff: float = 1.0) -> float:
+    return 1.0 - math.exp(-coeff * x)
+
+
+def _bound_exp_inv(x: float, coeff: float = 1.0) -> float:
+    return 1.0 if x > 0.9995 else -math.log(1.0 - x) / coeff
+
+
+def _calibrate_hs(dev_type: str, h: float, s: float) -> (float, float):
+    try:
+        cal = HS_CALIBRATION[dev_type]
+        new_h = h if cal[0] is None else _piecewise(h, list(zip(DEFAULT_HUE, cal[0])))
+        new_s = s if cal[1] is None else 100.0 * _bound_exp(s / 100.0, cal[1])
+    except Exception:
+        return h, s
+
+    return new_h, new_s
+
+
+def _calibrate_hs_inv(dev_type: str, h: float, s: float) -> (float, float):
+    try:
+        cal = HS_CALIBRATION[dev_type]
+        new_h = h if cal[0] is None else _piecewise_inv(h, list(zip(DEFAULT_HUE, cal[0])))
+        new_s = s if cal[1] is None else 100.0 * _bound_exp_inv(s / 100.0, cal[1])
+    except Exception:
+        return h, s
+
+    return new_h, new_s
 
 
 class MLLightBase(me.MerossToggle, light.LightEntity):
@@ -228,14 +285,16 @@ class MLLight(MLLightBase):
         capacity = 0
         color_mode = None
 
-        if (ATTR_HS_COLOR in kwargs) or (ATTR_RGB_COLOR in kwargs):
+        if any(c in kwargs for c in (ATTR_HS_COLOR, ATTR_RGB_COLOR)):
             light.pop(mc.KEY_TEMPERATURE, None)
 
             if ATTR_HS_COLOR in kwargs:
                 h, s = kwargs[ATTR_HS_COLOR]
-                val = color_util.color_hs_to_RGB(h, s)
             else:
-                val = kwargs[ATTR_RGB_COLOR]
+                h, s = color_util.color_RGB_to_hs(*kwargs[ATTR_RGB_COLOR])
+
+            h, s = _calibrate_hs(self.manager.descriptor.system['hardware']['type'], h, s)
+            val = color_util.color_hs_to_RGB(h, s)
 
             color_mode = mc.LIGHT_CAPACITY_RGB
             key = mc.KEY_RGB
@@ -381,6 +440,10 @@ class MLLight(MLLightBase):
                     if effect < len(effects):
                         self._attr_effect = effects[effect]  # type: ignore
 
+        if mc.KEY_RGB in payload:
+            dev_type = self.manager.descriptor.system['hardware']['type']
+            self._attr_hs_color = _calibrate_hs_inv(dev_type, *self._attr_hs_color)
+            self._attr_rgb_color = color_util.color_hs_to_RGB(*self._attr_hs_color)
 
 class MLDNDLightEntity(me.MerossEntity, light.LightEntity):
     """
