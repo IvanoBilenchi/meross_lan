@@ -299,7 +299,8 @@ class MLLight(MLLightBase):
     async def async_turn_off(self, **kwargs):
         if self._hastogglex:
             # we suppose we have to 'toggle(x)'
-            await super().async_turn_off(**kwargs)
+            if self.is_on:
+                await super().async_turn_off(**kwargs)
         else:
 
             def _ack_callback(acknowledge: bool, header: dict, payload: dict):
