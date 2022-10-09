@@ -207,6 +207,8 @@ class MLLight(MLLightBase):
             mc.KEY_CAPACITY, mc.LIGHT_CAPACITY_LUMINANCE
         )
 
+        self._last_color_mode = (0, 0)
+
         # new color_mode support from 2021.4.0
         self._attr_supported_color_modes = set()
         if self._capacity & mc.LIGHT_CAPACITY_RGB:
@@ -222,38 +224,50 @@ class MLLight(MLLightBase):
 
     async def async_turn_on(self, **kwargs):
         light = dict(self._light)
-        # we need to preserve actual capacity in case HA tells to just toggle
-        capacity = light.get(mc.KEY_CAPACITY, 0)
-        # Color is taken from either of these 2 values, but not both.
+
+        capacity = 0
+        color_mode = None
+
         if (ATTR_HS_COLOR in kwargs) or (ATTR_RGB_COLOR in kwargs):
+            light.pop(mc.KEY_TEMPERATURE, None)
+
             if ATTR_HS_COLOR in kwargs:
                 h, s = kwargs[ATTR_HS_COLOR]
-                rgb = color_util.color_hs_to_RGB(h, s)
+                val = color_util.color_hs_to_RGB(h, s)
             else:
-                rgb = kwargs[ATTR_RGB_COLOR]
-            light[mc.KEY_RGB] = _rgb_to_int(rgb)
-            light.pop(mc.KEY_TEMPERATURE, None)
-            capacity |= mc.LIGHT_CAPACITY_RGB
-            capacity &= ~mc.LIGHT_CAPACITY_TEMPERATURE
-        elif ATTR_COLOR_TEMP in kwargs:
-            # map mireds: min_mireds -> 100 - max_mireds -> 1
-            mired = kwargs[ATTR_COLOR_TEMP]
-            norm_value = (mired - self.min_mireds) / (self.max_mireds - self.min_mireds)
-            temperature = 100 - (norm_value * 99)
-            light[mc.KEY_TEMPERATURE] = _sat_1_100(
-                temperature
-            )  # meross wants temp between 1-100
-            light.pop(mc.KEY_RGB, None)
-            capacity |= mc.LIGHT_CAPACITY_TEMPERATURE
-            capacity &= ~mc.LIGHT_CAPACITY_RGB
+                val = kwargs[ATTR_RGB_COLOR]
 
-        # Brightness must always be set in payload
+            color_mode = mc.LIGHT_CAPACITY_RGB
+            key = mc.KEY_RGB
+            val = _rgb_to_int(val)
+        elif ATTR_COLOR_TEMP in kwargs:
+            light.pop(mc.KEY_RGB, None)
+
+            mired = kwargs[ATTR_COLOR_TEMP]
+            mired = (mired - self.min_mireds) / (self.max_mireds - self.min_mireds)
+
+            color_mode = mc.LIGHT_CAPACITY_TEMPERATURE
+            key = mc.KEY_TEMPERATURE
+            val = _sat_1_100(100 - (mired * 99))
+
+        if color_mode:
+            if self._last_color_mode:
+                mode_changed = self._last_color_mode[0] != color_mode
+                val_changed = self._last_color_mode[1] != val
+            else:
+                mode_changed = True
+                val_changed = True
+
+            if val_changed or mode_changed:
+                light[key] = val
+                capacity |= color_mode
+                self._last_color_mode = (color_mode, val)
+            else:
+                light.pop(key, None)
+
         if ATTR_BRIGHTNESS in kwargs:
             light[mc.KEY_LUMINANCE] = _sat_1_100(kwargs[ATTR_BRIGHTNESS] * 100 / 255 + 0.5)
-        else:
-            if mc.KEY_LUMINANCE not in light:
-                light[mc.KEY_LUMINANCE] = 100
-        capacity |= mc.LIGHT_CAPACITY_LUMINANCE
+            capacity |= mc.LIGHT_CAPACITY_LUMINANCE
 
         if ATTR_EFFECT in kwargs:
             effect = reverse_lookup(self._light_effect_map, kwargs[ATTR_EFFECT])
@@ -279,7 +293,11 @@ class MLLight(MLLightBase):
                 self._light = {}  # invalidate so _parse_light will force-flush
                 self._parse_light(light)
 
+        # Ivano: assume call was successful and immediately reflect change in HA
+        self._attr_state = me.STATE_ON
+        self._parse_light(light)
         await self.manager.async_request_light(light, _ack_callback)
+
         # 87: @nao-pon bulbs need a 'double' send when setting Temp
         if ATTR_COLOR_TEMP in kwargs:
             if self.manager.descriptor.firmwareVersion == "2.1.2":
